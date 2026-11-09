@@ -1,0 +1,6 @@
+.venv/
+.runtime/
+results/
+__pycache__/
+.pytest_cache/
+*.key
