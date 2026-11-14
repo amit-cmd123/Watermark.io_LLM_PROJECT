@@ -4,3 +4,9 @@ results/
 __pycache__/
 .pytest_cache/
 *.key
+.runtime/
+.venv/
+__pycache__/
+*.pyc
+*.key
+.taste-skill/chrome*/

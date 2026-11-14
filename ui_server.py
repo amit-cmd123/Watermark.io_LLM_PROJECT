@@ -19,7 +19,10 @@ TOKEN = secrets.token_hex(24)
 
 
 def validate(data):
-    if data.get('action') not in ('generate', 'detect', 'attack', 'smoke', 'experiment'):
+    data.setdefault('scheme', 'v1')
+    if data['scheme'] not in ('v1', 'v2-h1', 'v2-h4', 'v2-min4'):
+        raise ValueError('Unknown scheme')
+    if data.get('action') not in ('generate', 'detect', 'attack', 'smoke', 'experiment', 'benchmark'):
         raise ValueError('Unknown action')
     if data.get('mode') not in ('offline', 'real'):
         raise ValueError('Choose offline or real mode')
@@ -46,7 +49,7 @@ def validate(data):
         raise ValueError('Enter text to test')
     if data['action'] == 'attack' and data['attack'] not in ('paraphrase', 'translation'):
         raise ValueError('Unknown attack')
-    if data['action'] in ('attack', 'experiment') and data['mode'] == 'offline':
+    if data['action'] in ('attack', 'experiment', 'benchmark') and data['mode'] == 'offline':
         raise ValueError('Select real model mode for language attacks or the full experiment')
     return data
 
@@ -93,6 +96,10 @@ def start_job(data):
         action = data['action']
         if action == 'smoke':
             command = [sys.executable, '-u', 'smoke.py']
+        elif action == 'benchmark':
+            command = [sys.executable, '-u', 'bench_eval.py', '--model', data['model'],
+                       '--limit', str(data['limit']), '--seeds', '2', '--tokens', str(min(data['max_new_tokens'], 300)),
+                       '--delta', str(data['delta'])]
         elif action == 'experiment':
             command = [sys.executable, '-u', 'evaluate.py', '--model', data['model'], '--revision', data['revision']]
             key_path = directory / 'watermark.key'
@@ -103,7 +110,7 @@ def start_job(data):
         else:
             command = [sys.executable, '-u', 'ui_worker.py', str(request), str(output)]
         log = directory / 'log.txt'
-        env = dict(os.environ, HF_HOME=str(ROOT / '.runtime' / 'huggingface'),
+        env = dict(os.environ, HF_HOME=str(ROOT / '.runtime' / 'huggingface'), HF_HUB_OFFLINE='1',
                    MPLCONFIGDIR=str(ROOT / '.runtime' / 'matplotlib'), PYTHONIOENCODING='utf-8')
         handle = log.open('w', encoding='utf-8')
         process = subprocess.Popen(command, cwd=ROOT, env=env, stdout=handle, stderr=subprocess.STDOUT)

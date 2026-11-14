@@ -22,25 +22,46 @@ def execute(data):
         print('Loading tokenizer (first use may download files)…', flush=True)
         tokenizer = load_pretrained(AutoTokenizer, data['model'], data['revision'])
         vocab = vocabulary_ids(tokenizer)
-    scheme = WatermarkScheme(vocab, data['key'].encode(), data['gamma'])
+    import engine
+    key = data['key'].encode()
+    name = data.get('scheme', 'v1')
+    if name == 'v1':
+        scheme = WatermarkScheme(vocab, key, data['gamma'])
+        make_proc = lambda: make_processor(scheme, data['delta'])
+        stats_of = lambda ids: detect_ids(ids, scheme, data['threshold'])
+    else:
+        scheme = engine.HashScheme(key, vocab, data['gamma'], context=1 if name == 'v2-h1' else 4,
+                                   agg='min' if name == 'v2-min4' else 'chain')
+        make_proc = lambda: engine.make_processor(scheme, data['delta'])
+        stats_of = lambda ids: engine.detect(ids, scheme, data['threshold'])
+
+    def statuses(ids):
+        if name == 'v1':
+            seen, out = set(), []
+            for i, current in enumerate(ids):
+                previous = ids[i - 1] if i else None
+                pair = (previous, current)
+                eligible = i > 0 and previous in scheme.eligible and current in scheme.eligible
+                out.append('ignored' if not eligible or pair in seen else
+                           'green' if current in scheme.green_set(previous) else 'ordinary')
+                seen.add(pair)
+            return out
+        import numpy as np
+        eligible, green, keys = scheme.flags_for_ids(ids)
+        keep = eligible.copy()
+        _, first = np.unique(keys[eligible], return_index=True)
+        mask = np.zeros(int(eligible.sum()), bool)
+        mask[first] = True
+        keep[np.flatnonzero(eligible)] = mask
+        return ['ignored'] * scheme.context + ['ignored' if not k else 'green' if g else 'ordinary'
+                                               for k, g in zip(keep, green)]
 
     def score(ids, text):
-        result = {'text': text, 'ids': ids,
-                  'stats': detect_ids(ids, scheme, data['threshold'])}
-        seen = set()
-        tokens = []
-        for i, current in enumerate(ids):
-            previous = ids[i - 1] if i else None
-            pair = (previous, current)
-            eligible = i > 0 and previous in scheme.eligible and current in scheme.eligible
-            status = ('ignored' if not eligible or pair in seen else
-                      'green' if current in scheme.green_set(previous) else 'ordinary')
-            seen.add(pair)
-            tokens.append({'text': f'{current} ' if offline else tokenizer.decode([current]),
-                           'status': status})
-        result['tokens'] = tokens
+        result = {'text': text, 'ids': ids, 'stats': stats_of(ids), 'scheme': name}
+        result['tokens'] = [{'text': f'{c} ' if offline else tokenizer.decode([c]), 'status': s}
+                            for c, s in zip(ids, statuses(ids))]
         if not offline:
-            result['text_stats'] = detect_text(text, tokenizer, scheme, data['threshold'])
+            result['text_stats'] = stats_of(tokenizer.encode(text, add_special_tokens=False))
         return result
 
     action = data['action']
@@ -95,7 +116,7 @@ def execute(data):
 
     if action == 'generate':
         samples = {}
-        for label, processor in [('Control', None), ('Watermarked', make_processor(scheme, data['delta']))]:
+        for label, processor in [('Control', None), ('Watermarked', make_proc())]:
             print('Generating ' + label.lower() + '…', flush=True)
             text, ids = generate(data['prompt'], data['seed'], processor)
             samples[label] = score(ids, text)

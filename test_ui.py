@@ -33,7 +33,7 @@ class DashboardTests(unittest.TestCase):
         base = f'http://127.0.0.1:{server.server_port}'
         try:
             with urlopen(base + '/') as response:
-                self.assertIn(b'Generate & compare', response.read())
+                self.assertIn(b'Generate &amp; compare', response.read())
             with urlopen(base + '/api/runs') as response:
                 runs = json.load(response)
                 self.assertIsInstance(runs, list)

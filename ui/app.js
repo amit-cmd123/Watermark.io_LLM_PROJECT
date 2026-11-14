@@ -1,253 +1,346 @@
-﻿const $ = id => document.getElementById(id);
-let tab = 'generate', token = '', job = null, archive = null, ready = false;
-let jobContext = null, activeResult = null, lastGenerated = null;
-const results = {};
-const copy = {
-  generate: ['Generate & compare', 'Read two passages side by side: one written normally, one with a hidden watermark.', 'What should the AI write?'],
-  detect: ['Check a passage', 'Look for the pattern made with your watermark key. This is not a general AI detector.', 'Choose what to check'],
-  attack: ['Try rewriting', 'Rewrite a watermarked passage, then check whether the hidden pattern survives.', 'Choose a rewriting method'],
-  experiment: ['Batch experiment', 'Test the watermark across multiple topics and rewritten versions.', 'Set up your experiment'],
-  results: ['Saved experiments', 'Review what earlier experiments measured and read their saved samples.', '']
-};
-const configIds = ['mode', 'model', 'revision', 'key', 'gamma', 'delta', 'threshold', 'max_new_tokens', 'temperature', 'top_p', 'seed'];
-async function api(url, data) {
-  const response = await fetch(url, data ? {method:'POST', headers:{'Content-Type':'application/json', 'X-Dashboard-Token':token}, body:JSON.stringify(data)} : {});
-  const value = await response.json();
-  if (!response.ok) throw Error(value.error || 'The request could not be completed.');
-  return value;
-}
-function error(e) { $('error').textContent = e.message; $('error').hidden = false; }
-function modeNotice() {
-  const offline = $('mode').value === 'offline';
-  $('model-fields').hidden = offline;
-  $('generation-fields').hidden = tab !== 'generate' || offline;
-  $('intro').hidden = tab !== 'generate';
-  $('text-label').textContent = offline ? 'Demo numbers to check' : 'Passage to check';
-  $('text').placeholder = offline ? 'Generate a demo first, or paste its numbers here: 12 45 8 …' : 'Paste the passage you want to check…';
-  $('text-help').textContent = offline
-    ? 'Each number stands for a token (a piece of text). Use numbers from the quick demo, with the same key and settings.'
-    : 'Use the same watermark key, model version, and favored token share used to generate this passage. Text from another AI will not necessarily contain this watermark.';
-  const notices = {
-    generate: offline
-      ? 'Start here: click Run quick demo below. You will get two sequences of numbers, each standing for a token. A tiny untrained model makes them, so they are not readable sentences. The starting input is fixed; there is no prompt to enter.'
-      : 'Write instructions below, then generate two readable samples. The first run may download the model and take longer. Some models require Hugging Face access.',
-    detect: offline
-      ? 'Check numbers from the quick demo. The detector rebuilds the favored choices using your key, then checks how often they appear.'
-      : 'The detector checks for your particular word-choice pattern. It only needs the tokenizer (the model’s text-to-token rules), so it does not generate new text.',
-    attack: offline
-      ? 'Rewriting needs readable text. Choose “Readable text” above, generate a watermarked sample, then bring it here using “Try rewriting this”.'
-      : 'Use a watermarked sample generated in readable-text mode. Rewording or translation changes token choices, which can weaken the pattern. Compare meaning and length as well as the score.',
-    experiment: offline
-      ? 'The full experiment needs readable text and language models. Choose “Readable text” above, or run the numeric batch demo below. The numeric demo tests token substitutions; it does not test real rewriting.'
-      : 'This runs generation, three rounds of rewording, and translation to French and back. It may download several models. Start with one topic to check your setup.'
-  };
-  $('notice').textContent = notices[tab] || '';
-  $('run').textContent = tab === 'generate' ? (offline ? 'Run quick demo' : 'Generate two samples') : tab === 'detect' ? 'Check for my watermark' : tab === 'attack' ? 'Rewrite and compare' : 'Run batch experiment';
-  $('run').disabled = !ready || Boolean(job) || (offline && ['attack', 'experiment'].includes(tab));
-  $('smoke').hidden = tab !== 'experiment' || !offline;
-  $('settings').hidden = tab === 'experiment' && offline;
-  $('delta').closest('label').hidden = !['generate', 'experiment'].includes(tab);
-  $('action-help').textContent = offline ? (tab === 'generate' ? 'No setup or downloads needed. Results appear below.' : tab === 'detect' ? 'Checking uses the key in Advanced settings.' : 'Choose readable text above to enable this action.') : 'First use may download model files. Progress appears below.';
-  $('use-last').hidden = !lastGenerated || lastGenerated.context.mode !== $('mode').value || !['detect', 'attack'].includes(tab);
-  document.querySelectorAll('[data-generate-only]').forEach(n => n.hidden = tab === 'detect');
-}
-function switchTab(name) {
-  tab = name;
-  document.querySelectorAll('[data-tab]').forEach(b => { b.classList.toggle('selected', b.dataset.tab === tab); b.setAttribute('aria-current', b.dataset.tab === tab ? 'page' : 'false'); });
-  $('heading').textContent = copy[tab][0]; $('description').textContent = copy[tab][1]; $('setup-heading').textContent = copy[tab][2];
-  $('controls').hidden = tab === 'results'; $('results').hidden = tab !== 'results';
-  $('text-fields').hidden = !['detect', 'attack'].includes(tab); $('attack-field').hidden = tab !== 'attack'; $('experiment-fields').hidden = tab !== 'experiment';
-  $('intro').hidden = tab !== 'generate'; $('error').hidden = true; $('progress').hidden = true;
-  $('navigation').classList.remove('open'); $('menu').setAttribute('aria-expanded', 'false');
-  $('output').hidden = !results[tab] || tab === 'results'; activeResult = results[tab] || null;
-  if (activeResult) render(activeResult);
-  modeNotice();
-  if (tab === 'results') refresh().catch(error);
-}
-function payload(action = tab) {
-  const data = {action};
-  for (const id of ['mode', 'model', 'revision', 'key', 'prompt', 'text', 'attack']) data[id] = $(id).value;
-  for (const id of ['gamma', 'delta', 'threshold', 'max_new_tokens', 'temperature', 'top_p', 'seed', 'limit']) data[id] = Number($(id).value);
-  return data;
-}
-function busy(value) {
-  document.querySelectorAll('#controls input, #controls select, #controls textarea, #controls button, nav button').forEach(n => n.disabled = value);
-  $('cancel').disabled = false; $('cancel').hidden = !value;
-  $('cancel').textContent = 'Stop run';
-  if (!value) modeNotice();
-}
-async function start(action) {
-  if (!ready || job) return;
-  $('error').hidden = true;
-  if (['detect', 'attack'].includes(action) && !$('text').value.trim()) {
-    error(Error('Add a sample first. Generate one, then choose “Check this sample”, or paste it into the passage box.')); $('text').focus(); return;
-  }
-  const data = payload(action);
-  jobContext = {...data};
-  busy(true); $('state').textContent = 'Starting'; $('progress').hidden = false;
-  $('progress-heading').textContent = ({generate:'Generating two samples', detect:'Checking your passage', attack:'Rewriting and checking', experiment:'Running the batch experiment', smoke:'Running the numeric batch demo'})[action];
-  $('progress-message').textContent = 'Starting the local job. ' + (data.mode === 'offline' ? 'No model downloads are needed.' : 'Model files may need to download on first use.');
-  $('log').textContent = 'Starting…';
-  try { job = (await api('/api/jobs', data)).id; poll(); }
-  catch (e) { busy(false); $('state').textContent = 'Could not start'; $('progress-message').textContent = 'The run could not start. Check the message above and try again.'; error(e); }
-}
-async function poll() {
-  try {
-    const current = await api('/api/jobs/' + job);
-    $('state').textContent = ({running:'Working', cancelling:'Stopping', cancelled:'Stopped', complete:'Finished', failed:'Needs attention'})[current.status] || current.status;
-    $('log').textContent = current.log || 'Loading the local dependencies…';
-    if (['running', 'cancelling'].includes(current.status)) {
-      const log = current.log || '';
-      $('progress-message').textContent = current.status === 'cancelling' ? 'Stopping this run. Please wait for the local job to close.'
-        : /Generating watermarked/i.test(log) ? 'Writing the sample with the hidden pattern. We will compare it with the ordinary sample.'
-        : /Generating control/i.test(log) ? 'Writing the ordinary sample first, without adding a watermark.'
-        : /Paraphrase round/i.test(log) ? 'Rewording the passage and measuring the pattern in each version.'
-        : /translation model/i.test(log) ? 'Preparing translation and checking the rewritten passage. First use may download translation models.'
-        : jobContext.mode === 'real' ? 'Preparing the language model. First use may download files; details are in the log below.'
-        : 'Preparing the tiny local model. No model downloads are needed.';
-      setTimeout(poll, 1200); return;
-    }
-    job = null; busy(false);
-    if (current.result?.samples) {
-      const entry = {result:current.result, context:jobContext};
-      results[tab] = entry; activeResult = entry;
-      if (jobContext.action === 'generate') lastGenerated = entry;
-      render(entry); modeNotice();
-      $('progress-message').textContent = 'Finished. Your results and explanation are below.';
-      $('output').scrollIntoView({behavior:'smooth', block:'start'});
-    } else if (current.status !== 'failed' && current.status !== 'cancelled') {
-      $('progress-message').textContent = 'Finished. Open Saved experiments to review the measurements.';
-      const open = el('button', 'View saved experiment', 'secondary'); open.onclick = () => switchTab('results'); $('progress-message').append(' ', open);
-    }
-    if (current.status === 'cancelled') $('progress-message').textContent = 'Stopped. You can change the settings and start again.';
-    if (current.status === 'failed') {
-      $('progress-message').textContent = 'The run stopped before it finished. Expand the technical progress log for details.';
-      const blockedDownload = /ProxyError|ConnectionError|LocalEntryNotFoundError|couldn.t connect|offline mode/i.test(current.log || '');
-      error(Error(blockedDownload && jobContext.mode === 'real'
-        ? 'The language model is not available locally, and its download could not connect. For the default Qwen model, run .\\download_model.ps1 in a normal PowerShell window with internet access, then generate again. For another model, pass -Model and -Revision to that script or enter its downloaded folder in Language model. The numeric test cannot produce paragraphs.'
-        : 'This run could not finish. Check the technical progress log for the model or dependency error.'));
-    }
-  } catch (e) {
-    $('state').textContent = 'Connection interrupted';
-    $('progress-message').textContent = 'Could not reach the local server. The job may still be running. Checking again…';
-    $('log').textContent = e.message;
-    setTimeout(poll, 3000);
-  }
-}
-function fmt(n, d = 2) { return n === null || n === undefined || n === '' ? '—' : Number(n).toFixed(d); }
-function el(tag, text, cls) { const node = document.createElement(tag); if (text !== undefined) node.textContent = text; if (cls) node.className = cls; return node; }
-function useSample(entry, sample, destination) {
-  for (const id of configIds) if (entry.context[id] !== undefined) $(id).value = entry.context[id];
-  $('text').value = sample.text;
-  switchTab(destination); $('text').focus();
-}
-function summarize(entry) {
-  const {result, context} = entry, samples = result.samples;
-  const box = $('takeaway'); box.replaceChildren();
-  box.append(el('p', result.offline ? 'Quick demo results · numeric tokens from an untrained model' : 'Readable-text results · ' + context.model, 'result-context'));
-  if (samples.Control && samples.Watermarked) {
-    const ordinary = samples.Control.stats, marked = samples.Watermarked.stats;
-    const expected = marked.detected && !ordinary.detected;
-    box.append(el('h3', expected ? 'The detector found the added pattern.' : marked.detected ? 'Both samples crossed the cutoff.' : 'The added pattern did not cross the cutoff.'));
-    box.append(el('p', 'Without watermark: score ' + fmt(ordinary.z_score) + '. With watermark: ' + fmt(marked.z_score) + '. The cutoff for this run is ' + marked.threshold + '.'));
-    box.append(el('p', expected ? 'The marked sample contains enough favored choices to trigger this detector. The ordinary sample does not.' : ordinary.detected ? 'The ordinary sample also triggered the detector. That is a false positive here, because no watermark was added to it.' : 'A watermark was added, but this sample did not provide enough evidence for detection. A longer output or stronger watermark may help.'));
-    box.append(el('p', result.offline ? 'These numbers are token IDs, not an error. This demo shows the mechanism with an untrained model. To generate sentences, choose readable text.' : 'Green highlights show favored token choices. Ordinary text can contain them too; their frequency is what matters.'));
-    const next = el('button', result.offline ? 'Next: check the marked sample' : 'Next: try rewriting the marked sample', 'secondary');
-    next.onclick = () => useSample(entry, samples.Watermarked, result.offline ? 'detect' : 'attack'); box.append(next);
-  } else if (context.action === 'detect') {
-    const stats = Object.values(samples)[0].stats;
-    box.append(el('h3', stats.scored_tokens === 0 ? 'There is not enough text to check.' : stats.detected ? 'The pattern matches this key.' : 'No strong match for this key.'));
-    box.append(el('p', 'Signal score: ' + fmt(stats.z_score) + '. Detection cutoff: ' + stats.threshold + '.'));
-    box.append(el('p', stats.detected ? 'This passage crossed the detector’s cutoff. That is evidence of this watermark, not proof of authorship.' : 'This does not prove the passage is human-written or unwatermarked. A different key, different model settings, rewriting, or a short sample can all hide the signal.'));
-  } else {
-    const items = Object.entries(samples), before = items[0][1].stats, after = items[items.length - 1][1].stats;
-    box.append(el('h3', after.detected ? 'The signal is still detectable after rewriting.' : 'The rewritten sample is below the cutoff.'));
-    box.append(el('p', 'Original score: ' + fmt(before.z_score) + '. Final rewritten score: ' + fmt(after.z_score) + '. Cutoff: ' + after.threshold + '.'));
-    if (!before.detected) box.append(el('p', 'The original was already below the cutoff, so this run cannot show that rewriting removed a detectable watermark.'));
-    box.append(el('p', 'Read both versions for changes in meaning and length. A shorter passage supplies less evidence, which can reduce its score.'));
-  }
-}
-function render(entry) {
-  const {result} = entry; $('samples').replaceChildren(); $('output').hidden = false;
-  summarize(entry);
-  for (const [name, sample] of Object.entries(result.samples)) {
-    const stats = sample.stats, card = el('article', undefined, 'sample'), head = el('div', undefined, 'sample-head');
-    head.append(el('h3', name === 'Control' ? 'Without watermark' : name === 'Watermarked' ? 'With watermark' : name === 'Detected input' ? 'Your passage' : name), el('span', stats.scored_tokens === 0 ? 'Not enough tokens' : stats.detected ? 'Pattern detected' : 'Below cutoff', 'verdict' + (stats.detected ? ' detected' : '')));
-    card.append(head);
-    card.append(el('p', name === 'Control' ? 'Generated normally. Favored choices can still appear by chance.' : name === 'Watermarked' ? 'Generated with extra preference for the hidden pattern.' : 'Checked with the same watermark key and detection settings.', 'sample-explanation'));
-    const metrics = el('div', undefined, 'metrics');
-    for (const [label, value] of [['Signal score', fmt(stats.z_score)], ['Favored choices', stats.green_ratio === null ? fmt(null) : fmt(stats.green_ratio * 100, 1) + '%'], ['Checked tokens', stats.scored_tokens]]) {
-      const metric = el('div'); metric.append(el('strong', String(value)), el('small', label)); metrics.append(metric);
-    }
-    if (!result.offline) {
-      card.append(el('div', sample.text || 'The model returned no readable text. Try another prompt or a larger output limit.', 'sample-prose'));
-      const copyText = el('button', 'Copy passage', 'text-button');
-      copyText.onclick = async () => {
-        try { await navigator.clipboard.writeText(sample.text); copyText.textContent = 'Passage copied'; }
-        catch { copyText.textContent = 'Select the passage above to copy it'; }
-      };
-      card.append(copyText);
-    }
-    const tokenView = el('details', undefined, 'token-view');
-    tokenView.append(el('summary', result.offline ? 'View numeric test tokens' : 'Inspect watermark highlights'));
-    tokenView.append(el('p', 'Green = favored choice · plain = other choice · gray = excluded from the score.' + (result.offline ? '' : ' Token fragments are shown here for inspection; the complete decoded passage is above.'), 'help'));
-    const text = el('div', undefined, 'tokens');
-    for (const t of sample.tokens) { const span = el('span', t.text, t.status); span.title = t.status === 'green' ? 'Favored token: counted toward the pattern' : t.status === 'ignored' ? 'Excluded from the score (first, special, or repeated token pair)' : 'Other token choice'; text.append(span); }
-    tokenView.append(text);
-    if (result.offline) {
-      card.append(el('p', 'This numeric test uses an untrained model, so it has no paragraph to display.', 'sample-note'));
-      const readable = el('button', 'Generate readable paragraphs', 'secondary');
-      readable.onclick = () => { $('mode').value = 'real'; switchTab('generate'); $('prompt').focus(); };
-      card.append(readable);
-    }
-    card.append(tokenView, metrics);
-    card.append(el('p', stats.scored_tokens === 0 ? 'No eligible token pairs were found, so there is no score to compare.' : 'Score ' + fmt(stats.z_score) + (stats.detected ? ' reaches ' : ' is below ') + 'the cutoff of ' + stats.threshold + '.', 'sample-note'));
-    const details = el('details'), summary = el('summary', 'Technical measurements'); details.append(summary, el('p', 'Z-score: ' + fmt(stats.z_score) + '. Approximate p-value: ' + (stats.p_value_approx === null ? 'unavailable' : Number(stats.p_value_approx).toExponential(2)) + (sample.text_stats ? '. Score after converting the displayed text back into tokens: ' + fmt(sample.text_stats.z_score) + '.' : '.'), 'sample-note')); card.append(details);
-    const actions = el('div', undefined, 'sample-actions');
-    const check = el('button', 'Check this sample', 'secondary'); check.onclick = () => useSample(entry, sample, 'detect'); actions.append(check);
-    if (!result.offline) { const rewrite = el('button', 'Try rewriting this', 'secondary'); rewrite.onclick = () => useSample(entry, sample, 'attack'); actions.append(rewrite); }
-    card.append(actions); $('samples').append(card);
-  }
-  $('french').textContent = result.french ? 'French version used between translations: ' + result.french : '';
-}
-function download(name, body, type) { const link = document.createElement('a'); link.href = URL.createObjectURL(new Blob([body], {type})); link.download = name; link.click(); setTimeout(() => URL.revokeObjectURL(link.href), 1000); }
-async function refresh() {
-  const prior = $('runs').value, runs = await api('/api/runs'); $('runs').replaceChildren();
-  for (const run of runs) { const option = el('option', (run.offline ? 'Numeric demo · ' : 'Language experiment · ') + run.name); option.value = run.name; $('runs').append(option); }
-  if (runs.some(r => r.name === prior)) $('runs').value = prior;
-  $('csv').disabled = !runs.length; $('runs').disabled = !runs.length;
-  if (runs.length) await loadRun();
-  else { archive = null; $('run-note').textContent = 'No experiments saved yet. Open Batch experiment to run one. Single sample comparisons stay in their own screen during this session.'; for (const id of ['rows','chart','passages','passage']) $(id).replaceChildren(); }
-}
-async function loadRun() {
-  archive = await api('/api/run?name=' + encodeURIComponent($('runs').value));
-  $('run-note').textContent = (archive.offline ? 'Numeric demo using synthetic token substitutions. This does not measure real paraphrasing or translation. ' : 'Language model experiment. ') + 'Run status: ' + archive.status.status + (archive.status.error ? ' · ' + archive.status.error : '');
-  $('rows').replaceChildren();
-  for (const row of archive.rows) { const tr = el('tr'); for (const value of [row.prompt_id || row.sample, row.condition.replaceAll('_',' '), row.scored_tokens, row.green_ratio == null ? fmt(null) : fmt(row.green_ratio * 100, 1) + '%', fmt(row.z_score), row.detected === true || row.detected === 'True' ? 'Yes' : 'No']) tr.append(el('td', String(value))); $('rows').append(tr); }
-  $('chart').replaceChildren(el('h2', 'Average signal score'));
-  const groups = Object.entries(archive.summary).filter(([, value]) => value && typeof value === 'object' && value.mean_z !== undefined);
-  const max = Math.max(1, ...groups.map(([, value]) => Math.abs(value.mean_z || 0)));
-  $('chart').append(el('p', 'Bars share a scale from −' + fmt(max) + ' to +' + fmt(max) + '. The center is zero. Counts show detected samples / checked samples.', 'chart-scale'));
-  if (!groups.length) $('chart').append(el('p', 'Measurements will appear as samples are checked.'));
-  for (const [name, value] of groups) {
-    const row = el('div', undefined, 'chart-row'), track = el('div', undefined, 'chart-track'), fill = el('div', undefined, 'chart-fill');
-    const score = value.mean_z || 0; fill.style.width = Math.abs(score) / max * 50 + '%'; fill.style.position = 'absolute'; fill.style.left = (score < 0 ? 50 - Math.abs(score) / max * 50 : 50) + '%'; track.append(fill);
-    row.append(el('span', name.replaceAll('_',' '), 'chart-label'), track, el('span', fmt(value.mean_z) + ' · ' + value.detected + '/' + value.samples, 'chart-value')); $('chart').append(row);
-  }
-  $('passages').replaceChildren(); for (const name of Object.keys(archive.texts)) { const option = el('option', name); option.value = name; $('passages').append(option); } showPassage();
-}
-function showPassage() { $('passage').textContent = archive?.texts[$('passages').value] || 'This run has no saved passages. Numeric demos save token IDs instead of prose.'; }
-document.querySelectorAll('[data-tab]').forEach(button => button.onclick = () => switchTab(button.dataset.tab));
-$('run').onclick = () => start(tab); $('smoke').onclick = () => start('smoke');
-$('cancel').onclick = async () => { try { if (job) { await api('/api/cancel', {id:job}); $('cancel').disabled = true; $('cancel').textContent = 'Stopping…'; } } catch (e) { error(e); } };
-$('mode').onchange = () => { $('error').hidden = true; modeNotice(); };
-$('menu').onclick = () => { const opened = $('navigation').classList.toggle('open'); $('menu').setAttribute('aria-expanded', String(opened)); };
-$('use-last').onclick = () => useSample(lastGenerated, lastGenerated.result.samples.Watermarked, tab);
-$('copy-key').onclick = async () => { try { await navigator.clipboard.writeText($('key').value); $('key-status').textContent = 'Key copied. Keep it somewhere private.'; } catch { $('key-status').textContent = 'Copy is unavailable. Select the key field and copy it manually.'; $('key').focus(); $('key').select(); } };
-$('refresh').onclick = () => refresh().catch(error); $('runs').onchange = () => loadRun().catch(error); $('passages').onchange = showPassage;
-$('presets').onchange = () => { if ($('presets').value) $('prompt').value = $('presets').value + ' Write a coherent passage of about 200 words.'; };
-$('export').onclick = () => { if (activeResult) download('watermark-comparison.json', JSON.stringify(activeResult.result, null, 2), 'application/json'); };
-$('csv').onclick = () => { if (!archive?.rows.length) return; const fields = Object.keys(archive.rows[0]); const escape = value => '"' + String(value ?? '').replaceAll('"','""') + '"'; download(archive.name + '.csv', [fields, ...archive.rows.map(row => fields.map(field => row[field]))].map(row => row.map(escape).join(',')).join('\r\n'), 'text/csv'); };
-for (const id of ['max_new_tokens','temperature','top_p','seed']) $(id).closest('label').setAttribute('data-generate-only','');
-api('/api/init').then(init => { token = init.token; $('key').value = init.key; for (const prompt of init.prompts) { const option = el('option', prompt); option.value = prompt; $('presets').append(option); } ready = true; switchTab('generate'); }).catch(e => { $('state').textContent = 'Server unavailable'; error(Error('Could not connect to Watermark Lab. Make sure the local server is running, then reload this page. ' + e.message)); });
+'use strict';
+const $ = id => document.getElementById(id);
+const NS = 'http://www.w3.org/2000/svg';
+const fmt = (v, d = 2) => (v == null || Number.isNaN(Number(v))) ? '—' : Number(v).toFixed(d);
+const pct = (v, d = 0) => v == null ? '—' : (v * 100).toFixed(d) + '%';
+const yes = v => v === true || v === 'True' || v === 'true';
+const COL = ['#5d5f60', '#1b6c80', '#2f70bb', '#a86f0c'];
 
+function el(tag, text, cls, attrs) {
+  const node = document.createElement(tag);
+  if (text != null) node.textContent = text;
+  if (cls) node.className = cls;
+  if (attrs) for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
+  return node;
+}
+function svg(tag, attrs, text) {
+  const node = document.createElementNS(NS, tag);
+  for (const [k, v] of Object.entries(attrs || {})) node.setAttribute(k, v);
+  if (text != null) node.textContent = text;
+  return node;
+}
+const card = (...kids) => { const c = el('div', null, 'card'); c.append(...kids); return c; };
+const signed = (v, d = 0) => (v >= 0 ? '+' : '−') + Math.abs(v).toFixed(d) + '%';
+const short = c => c.replace('words ', '').replace('translate to French and back (per sentence)', 'translated').replace('translate to French and back', 'translated')
+  .replace('paraphrase each sentence', 'paraphrased, per sentence').replace('paraphrase whole text', 'paraphrased, whole').replace('none', 'no change');
+
+let token = '', mode = 'real', view = 'results', last = null, polling = null, jobId = null, archive = null;
+
+async function api(url, data) {
+  const response = await fetch(url, data ? { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Dashboard-Token': token }, body: JSON.stringify(data) } : {});
+  const body = await response.json();
+  if (!response.ok) throw new Error(body.error || response.statusText);
+  return body;
+}
+
+const TABS = { generate: ['Generate & compare', 'Generate & compare'], detect: ['Check text', 'Check text'], attack: ['Rewrite test', 'Run rewrite test'] };
+const TITLES = { results: 'Compare', runs: 'Runs' };
+
+function setView(next) {
+  view = next;
+  document.body.classList.remove('nav-open');
+  for (const b of $('nav').children) b.classList.toggle('on', b.dataset.view === next);
+  const bench = next in TABS;
+  $('results').hidden = next !== 'results'; $('bench').hidden = !bench; $('runs').hidden = next !== 'runs';
+  $('crumb').textContent = bench ? TABS[next][0] : TITLES[next];
+  if (bench) {
+    $('title').textContent = TABS[next][0]; $('run').textContent = TABS[next][1];
+    $('in-generate').hidden = next !== 'generate'; $('in-text').hidden = next === 'generate';
+    $('attack-pick').hidden = next !== 'attack'; $('use-last').hidden = !last || next === 'generate';
+    $('result').replaceChildren();
+  }
+  if (next === 'runs') loadRuns();
+  if (next === 'results') loadBenchmark();
+}
+
+function setMode(next) {
+  mode = next;
+  for (const b of document.querySelectorAll('.seg button')) b.classList.toggle('on', b.dataset.mode === next);
+}
+
+function settings(action) {
+  const num = id => Number($(id).value);
+  return {
+    action, mode, scheme: $('scheme').value, model: $('model').value.trim(), revision: $('revision').value.trim() || 'main', key: $('key').value,
+    prompt: $('prompt').value, text: $('text').value, attack: $('attack').value,
+    gamma: num('gamma'), delta: num('delta'), threshold: num('threshold'), temperature: num('temperature'),
+    top_p: num('top_p'), max_new_tokens: num('max_new_tokens'), seed: num('seed'),
+    limit: action === 'benchmark' ? num('bench-limit') : (num('limit') || 1),
+  };
+}
+
+/* ---------- jobs ---------- */
+function chip(state, text) { const c = $('job-chip'); c.className = 'chip ' + state; c.lastElementChild.textContent = text; }
+function setBusy(busy) { for (const id of ['run', 'run-exp', 'run-bench']) $(id).disabled = busy; $('cancel').hidden = !busy; }
+const JOB_NAMES = { generate: 'Generating', detect: 'Scoring', attack: 'Rewriting', experiment: 'Experiment', benchmark: 'Benchmark', smoke: 'Demo' };
+const outBox = () => view in TABS ? $('result') : view === 'results' ? $('bench-out') : $('run-detail');
+
+async function start(action) {
+  $('result').replaceChildren(); setBusy(true); chip('run', 'Running');
+  $('job').hidden = false; $('log').textContent = ''; $('job-title').textContent = JOB_NAMES[action] || 'Working';
+  const started = Date.now();
+  try {
+    const { id } = await api('/api/jobs', settings(action)); jobId = id;
+    polling = setInterval(async () => {
+      try {
+        const job = await api('/api/jobs/' + id);
+        $('log').textContent = job.log.trim().split('\n').slice(-5).join('\n'); $('log').scrollTop = 1e9;
+        const s = Math.round((Date.now() - started) / 1000);
+        $('job-time').textContent = s >= 60 ? Math.floor(s / 60) + 'm ' + (s % 60) + 's' : s + 's';
+        if (job.status === 'running' || job.status === 'cancelling') return;
+        clearInterval(polling); finish(job, action);
+      } catch (e) { clearInterval(polling); fail(e.message); }
+    }, 1000);
+  } catch (e) { fail(e.message); }
+}
+function fail(message) { setBusy(false); chip('bad', 'Failed'); $('job').hidden = true; outBox().replaceChildren(el('div', message, 'err')); }
+function finish(job, action) {
+  setBusy(false); $('job').hidden = true;
+  if (job.status === 'cancelled') { chip('', 'Cancelled'); return; }
+  if (job.status === 'failed') {
+    chip('bad', 'Failed'); const box = el('div', job.log.trim().split('\n').slice(-5).join('\n'), 'err'); box.style.whiteSpace = 'pre-wrap'; outBox().replaceChildren(box); return;
+  }
+  chip('ok', 'Done');
+  if (action === 'benchmark') return setView('results');
+  if (action === 'experiment' || action === 'smoke') return setView('runs');
+  if (job.result) renderResult(job.result, action);
+}
+
+/* ---------- charts ---------- */
+function hbars(rows, opts = {}) {
+  const W = 720, L = opts.left || 190, R = 130, rowH = 28, H = rows.length * rowH + 8;
+  const max = opts.max || Math.max(...rows.map(r => r.value), 1e-9);
+  const s = svg('svg', { viewBox: `0 0 ${W} ${H}`, class: 'chart', role: 'img', 'aria-label': opts.label || 'Bar chart' });
+  rows.forEach((r, i) => {
+    const y = 4 + i * rowH, w = Math.max(2, r.value / max * (W - L - R));
+    s.append(svg('text', { x: L - 10, y: y + 17, 'text-anchor': 'end' }, r.label), svg('rect', { x: L, y: y + 4, width: w, height: 16, rx: 3, fill: r.color }), svg('text', { x: L + w + 8, y: y + 17, class: 'num' }, r.text));
+  });
+  return s;
+}
+
+/* One dot per text: grey = unwatermarked, colour = watermarked. Right of the dashed line = detected. */
+function strip(sm, cond) {
+  const names = Object.keys(sm.schemes), W = 720, L = 190, R = 84, rowH = 50, top = 26, T = sm.threshold;
+  const all = names.flatMap(n => [...sm.schemes[n].conditions[cond].z, ...sm.schemes[n].control_z]);
+  const hi = Math.min(30, Math.max(T * 2, ...all)), lo = Math.max(-6, Math.min(-2, ...all));
+  const x = z => L + (Math.max(lo, Math.min(hi, z)) - lo) / (hi - lo) * (W - L - R);
+  const H = top + names.length * rowH + 22;
+  const s = svg('svg', { viewBox: `0 0 ${W} ${H}`, class: 'chart', role: 'img', 'aria-label': 'Score of every text after: ' + short(cond) });
+  for (const t of [0, 5, 10, 20, 30].filter(t => t > lo && t < hi)) s.append(svg('line', { x1: x(t), x2: x(t), y1: top - 6, y2: H - 18, stroke: '#f0f1f2' }), svg('text', { x: x(t), y: H - 4, 'text-anchor': 'middle' }, String(t)));
+  s.append(svg('line', { x1: x(T), x2: x(T), y1: top - 12, y2: H - 18, stroke: '#131416', 'stroke-dasharray': '5 4', opacity: .7 }), svg('text', { x: x(T) + 6, y: top - 8 }, 'detected →'));
+  names.forEach((n, i) => {
+    const cy = top + i * rowH + rowH / 2, d = sm.schemes[n], c = d.conditions[cond];
+    if (i) s.append(svg('line', { x1: 0, x2: W, y1: cy - rowH / 2, y2: cy - rowH / 2, stroke: '#f0f1f2' }));
+    s.append(svg('text', { x: L - 12, y: cy + 4, 'text-anchor': 'end' }, n));
+    d.control_z.forEach((z, j) => { const dot = svg('circle', { cx: x(z), cy: cy - 10 + ((j * 7) % 5 - 2) * 2.4, r: 3.4, fill: '#cdced1', opacity: .9 }); dot.append(svg('title', {}, 'unwatermarked text · z ' + fmt(z, 1))); s.append(dot); });
+    c.z.forEach((z, j) => { const dot = svg('circle', { cx: x(z), cy: cy + 11 + ((j * 7) % 5 - 2) * 2.4, r: 3.6, fill: COL[i % 4], opacity: .8 }); dot.append(svg('title', {}, 'watermarked text · z ' + fmt(z, 1))); s.append(dot); });
+    s.append(svg('text', { x: W - R + 12, y: cy - 2, class: 'num' }, pct(c.tpr) + ' found'), svg('text', { x: W - R + 12, y: cy + 14 }, pct(d.fpr) + ' false'));
+  });
+  return s;
+}
+
+/* ---------- compare ---------- */
+function noise(p1, p2, n) { const c = p => Math.min(.95, Math.max(.05, p)); return 2 * Math.sqrt(c(p1) * (1 - c(p1)) / n + c(p2) * (1 - c(p2)) / n); }
+
+function verdictChips(sm) {
+  const names = Object.keys(sm.schemes), S = sm.schemes, base = names[0], n = sm.samples, conds = sm.conditions.filter(c => c !== 'none');
+  const row = el('div', null, 'vrow'), add = (label, big, sub, cls) => { const d = el('div', null, 'vchip ' + (cls || '')); d.append(el('span', label, 'l'), el('b', big), el('span', sub, 's')); row.append(d); };
+  const fast = names.slice().sort((a, b) => S[a].overhead_pct - S[b].overhead_pct)[0];
+  add('Fastest', fast, signed(S[fast].overhead_pct) + ' time vs none');
+  const avg = k => conds.reduce((a, c) => a + S[k].conditions[c].tpr, 0) / conds.length;
+  const best = names.slice().sort((a, b) => avg(b) - avg(a))[0];
+  const clear = best !== base && avg(best) - avg(base) > noise(avg(best), avg(base), n);
+  add('Survives changes best', clear ? best : 'no clear winner', clear ? pct(avg(best)) + ' avg found vs ' + pct(avg(base)) + ' for ' + base : '±' + fmt(100 * noise(.5, .5, n), 0) + ' pts noise at ' + n + ' texts', clear ? 'good' : 'flat');
+  const pp = names.map(k => S[k].perplexity_vs_control_pct);
+  add('Text quality', signed(Math.min(...pp)) + ' to ' + signed(Math.max(...pp)), 'perplexity vs unwatermarked');
+  const fa = Math.max(...names.map(k => S[k].fpr));
+  add('False alarms', pct(fa), 'worst scheme, unwatermarked text', fa > .05 ? 'bad' : '');
+  return row;
+}
+
+function heat(v) { const sp = el('span', pct(v), 'hm'); sp.style.background = `rgba(27,108,128,${.06 + v * .6})`; sp.style.color = v > .65 ? '#fff' : 'inherit'; return sp; }
+function th(text, tip, right) { const h = el('th', text, right ? 'n' : ''); if (tip) h.title = tip; return h; }
+
+function scoreboard(sm) {
+  const names = Object.keys(sm.schemes), S = sm.schemes, wrap = el('div', null, 'tablewrap tall'), t = el('table'), hr = el('tr');
+  hr.append(th('Scheme'), th('Speed', 'Tokens per second while generating, and extra time versus no watermark', 1),
+    th('Perplexity', 'How surprising the text is to the base model. Change versus unwatermarked text; lower is closer to normal', 1),
+    th('False alarms', 'Share of unwatermarked texts wrongly flagged', 1));
+  for (const c of sm.conditions) hr.append(th(short(c), 'Share of watermarked texts still detected after: ' + short(c), 1));
+  t.append(hr);
+  const row = (name, d, ctl, i) => {
+    const tr = el('tr'), nm = el('td'); if (!ctl) { const sw = el('i', null, 'sw'); sw.style.background = COL[i % 4]; nm.append(sw); } nm.append(document.createTextNode(name)); tr.append(nm);
+    tr.append(el('td', fmt(d.tokens_per_second, 1) + ' tok/s' + (ctl ? '' : '  ' + signed(d.overhead_pct)), 'n'),
+      el('td', fmt(d.perplexity, 1) + (ctl ? '' : '  ' + signed(d.perplexity_vs_control_pct)), 'n'), el('td', ctl ? '—' : pct(d.fpr), 'n'));
+    for (const c of sm.conditions) { const td = el('td', null, 'n'); if (ctl) td.textContent = '—'; else td.append(heat(d.conditions[c].tpr)); tr.append(td); }
+    t.append(tr);
+  };
+  row('no watermark', sm.control, true);
+  names.forEach((n, i) => row(n, S[n], false, i));
+  wrap.append(t);
+  return wrap;
+}
+
+function renderBenchmark(sm, box) {
+  box.replaceChildren();
+  const names = Object.keys(sm.schemes), S = sm.schemes;
+  box.append(el('p', `${sm.model} · ${sm.samples} texts per scheme · ${sm.max_new_tokens} tokens · strength ${sm.delta} · ${sm.created_at.replace('T', ' ')}`, 'meta'));
+  if (sm.samples < 20) { const b = el('div', `Preview: ${sm.samples} texts per scheme. Too few to compare schemes.`, 'banner'); box.append(b); }
+  box.append(verdictChips(sm), card(scoreboard(sm)));
+
+  const area = el('div'), tabs = el('div', null, 'atabs'), head = el('div', null, 'row-between');
+  const legend = el('div', null, 'legend-row'); legend.innerHTML = '<span><i style="background:#cdced1"></i>unwatermarked</span><span><i style="background:#1b6c80"></i>watermarked</span><span>one dot per text · right of the dashed line = detected</span>';
+  const draw = c => { area.replaceChildren(strip(sm, c)); for (const b of tabs.children) b.classList.toggle('on', b.dataset.c === c); };
+  for (const c of sm.conditions) { const b = el('button', short(c), null, { 'data-c': c }); b.onclick = () => draw(c); tabs.append(b); }
+  head.append(el('h2', 'Every text, after the change'), tabs);
+  box.append(card(head, legend, area));
+  draw(sm.conditions.find(c => c.startsWith('translate')) || sm.conditions[sm.conditions.length - 1]);
+
+  if (sm.fidelity) {
+    const rows = Object.entries(sm.fidelity).map(([c, v]) => ({ label: short(c), value: Math.max(v, 0), text: fmt(v, 2), color: '#2f70bb' }));
+    box.append(card(el('h2', 'Rewrite fidelity'), el('p', '1.00 = same meaning · a different answer to the same prompt ≈ 0.67', 'meta'), hbars(rows, { max: 1, left: 200, label: 'Rewrite fidelity' })));
+  }
+
+  const opts = [['no watermark', sm.control.sample]];
+  for (const n of names) { opts.push([n, S[n].sample]); if (S[n].back_translation_sample) opts.push([n + ' → rewritten', S[n].back_translation_sample]); }
+  const sel = el('select'); for (const [l] of opts) sel.append(el('option', l));
+  const body = el('div', opts[0][1], 'hl'); sel.onchange = () => { body.textContent = opts[sel.selectedIndex][1]; };
+  const rd = el('div', null, 'row-between'); rd.append(el('h2', 'Read the text'), sel);
+  box.append(card(rd, body));
+
+  const lim = el('details', null, 'card settings'), ul = el('ul', null, 'caveats');
+  for (const x of ['One model, one strength, one run.', 'Unwatermarked text here is model-written, not human.', 'Edits are random, not a person or a paraphraser.', 'No attacker adapted to the scheme.']) ul.append(el('li', x));
+  lim.append(el('summary', 'Limits'), ul); box.append(lim);
+}
+
+async function loadBenchmark() {
+  const box = $('bench-out'); box.replaceChildren(el('p', 'Loading…', 'meta'));
+  try {
+    const runs = await api('/api/runs');
+    const found = runs.filter(r => r.summary && r.summary.kind === 'benchmark').sort((a, b) => (b.summary.samples - a.summary.samples) || (a.name < b.name ? 1 : -1));
+    const running = runs.find(r => r.name.startsWith('benchmark-') && r.status && r.status.status === 'running' && r.status.total);
+    if (!found.length) {
+      const e = el('div', null, 'empty'); e.append(el('h2', running ? `Running · ${running.status.completed}/${running.status.total}` : 'No results yet'), el('p', running ? (running.status.stage || '') : 'Run benchmark, top right.'));
+      box.replaceChildren(e); return;
+    }
+    const sel = el('select'); sel.style.cssText = 'max-width:420px;margin-bottom:12px';
+    for (const r of found) sel.append(el('option', `${r.name.replace('benchmark-', '')} · ${r.summary.samples} texts · ${Object.keys(r.summary.schemes).length} schemes`));
+    const body = el('div'); sel.onchange = () => renderBenchmark(found[sel.selectedIndex].summary, body);
+    box.replaceChildren(...(found.length > 1 ? [sel, body] : [body])); renderBenchmark(found[0].summary, body);
+  } catch (e) { box.replaceChildren(el('div', e.message, 'err')); }
+}
+
+/* ---------- test screens ---------- */
+function trajectory(samples, threshold) {
+  const names = Object.keys(samples), W = 720, H = 230, L = 44, R = 24, T = 30, B = 36;
+  const zs = names.map(n => samples[n].stats.z_score), real = zs.filter(z => z != null);
+  const top = Math.max(threshold * 1.6, ...real, 2), bottom = Math.min(-1, ...real);
+  const x = i => L + (names.length === 1 ? (W - L - R) / 2 : i * (W - L - R) / (names.length - 1));
+  const y = z => T + (top - z) * (H - T - B) / (top - bottom);
+  const s = svg('svg', { viewBox: `0 0 ${W} ${H}`, class: 'chart', role: 'img', 'aria-label': 'Score at each step' });
+  for (const t of [0, Math.round(top / 2), Math.round(top)]) s.append(svg('line', { x1: L, x2: W - R, y1: y(t), y2: y(t), stroke: '#f0f1f2' }), svg('text', { x: L - 8, y: y(t) + 4, 'text-anchor': 'end' }, String(t)));
+  s.append(svg('line', { x1: L, x2: W - R, y1: y(threshold), y2: y(threshold), stroke: '#131416', 'stroke-dasharray': '5 4', opacity: .6 }), svg('text', { x: W - R, y: y(threshold) - 6, 'text-anchor': 'end' }, 'detected above'));
+  const pts = names.map((n, i) => [x(i), zs[i] == null ? null : y(zs[i])]).filter(p => p[1] != null);
+  if (pts.length > 1) s.append(svg('polyline', { points: pts.map(p => p.join(',')).join(' '), fill: 'none', stroke: '#1b6c80', 'stroke-width': 2 }));
+  names.forEach((n, i) => {
+    s.append(svg('text', { x: x(i), y: H - 12, 'text-anchor': names.length > 1 && i === names.length - 1 ? 'end' : names.length > 1 && i === 0 ? 'start' : 'middle' }, n));
+    if (zs[i] == null) return; const hit = samples[n].stats.detected;
+    s.append(svg('circle', { cx: x(i), cy: y(zs[i]), r: 6, fill: hit ? '#1e7b4f' : '#fff', stroke: hit ? '#1e7b4f' : '#c4242a', 'stroke-width': 2 }), svg('text', { x: x(i), y: y(zs[i]) - 12, 'text-anchor': 'middle', class: 'num' }, fmt(zs[i], 1)));
+  });
+  return s;
+}
+
+function sampleCard(name, sample, result, threshold) {
+  const st = sample.stats, c = el('div', null, 'card sample'), gamma = Number($('gamma').value);
+  const verdict = st.z_score == null ? ['Too short', 'neu'] : st.detected ? ['Detected', 'pos'] : ['Not detected', 'neg'];
+  const head = el('header'), left = el('div', null, 'who');
+  left.append(el('h3', name), el('span', verdict[0], 'pill ' + verdict[1]));
+  const big = el('div', null, 'bigz', { title: 'z-score: how far above chance the share of favored words is. Detected at ' + threshold + ' or more.' }); big.append(el('b', fmt(st.z_score, 1)), el('span', 'z'));
+  head.append(left, big); c.append(head);
+  const gauge = el('div', null, 'gauge'), max = Math.max(threshold * 2, st.z_score || 0, 1), fill = el('i'), mark = el('u');
+  fill.style.width = Math.max(0, Math.min(100, (st.z_score || 0) / max * 100)) + '%'; mark.style.left = threshold / max * 100 + '%'; gauge.append(fill, mark); c.append(gauge);
+  const body = el('div', null, 'hl'); for (const t of sample.tokens) body.append(el('span', t.text, t.status)); c.append(body);
+  c.append(el('p', st.z_score == null ? 'not enough text' : `${st.green_tokens} of ${st.scored_tokens} favored · ${pct(gamma)} expected by chance`, 'meta foot'));
+  const row = el('div', null, 'actions'); row.style.margin = '8px 0 0';
+  if (!result.offline) { const b = el('button', 'Rewrite this', 'ghost'); b.onclick = () => useSample(sample, 'attack'); row.append(b); }
+  const k = el('button', 'Check this', 'ghost'); k.onclick = () => useSample(sample, 'detect'); row.append(k); c.append(row);
+  return c;
+}
+
+function renderResult(result, action) {
+  const out = $('result'), threshold = Number($('threshold').value), samples = result.samples, names = Object.keys(samples);
+  out.replaceChildren();
+  if (action === 'generate' && samples.Watermarked) { last = samples.Watermarked; $('use-last').hidden = false; }
+  if (names.length > 2) out.append(card(trajectory(samples, threshold)));
+  const lg = el('div', null, 'legend-row'); lg.innerHTML = '<span><i style="background:var(--green-bg);outline:1px solid #9fd8b4"></i>favored word</span><span><i style="background:#fff;outline:1px solid #cdced1"></i>other</span><span><i style="background:#fff;outline:1px solid #cdced1;opacity:.45"></i>not counted</span>' + (result.offline ? '<span>demo: numbers are token IDs</span>' : '');
+  out.append(lg);
+  if (result.french) out.append(card(el('h3', 'In French'), el('p', result.french, 'small')));
+  const grid = el('div', null, 'cmpgrid'); for (const n of names) grid.append(sampleCard(n, samples[n], result, threshold)); out.append(grid);
+}
+function useSample(sample, tab) { $('text').value = sample.text; setView(tab); window.scrollTo(0, 0); }
+
+/* ---------- runs ---------- */
+async function loadRuns() {
+  const list = $('run-list'); list.replaceChildren(el('p', 'Loading…', 'meta'));
+  try {
+    const runs = await api('/api/runs'); list.replaceChildren();
+    if (!runs.length) list.append(el('p', 'No runs.', 'meta'));
+    for (const r of runs) {
+      const b = el('button', null, 'run'), s = r.status || {};
+      const kind = r.name.startsWith('benchmark') ? 'Benchmark' : r.offline ? 'Demo' : r.name.startsWith('research') ? 'Research' : 'Experiment';
+      b.append(el('b', r.name), el('span', kind + ' · ' + (s.status || 'saved') + (s.scored_texts != null ? ' · ' + s.scored_texts + ' texts' : s.total ? ` · ${s.completed}/${s.total}` : ''), 'small'));
+      b.onclick = () => { for (const x of list.children) x.classList.remove('on'); b.classList.add('on'); openRun(r.name); }; list.append(b);
+    }
+    const e = el('div', null, 'empty'); e.append(el('p', 'Pick a run.')); $('run-detail').replaceChildren(e);
+  } catch (e) { list.replaceChildren(el('div', e.message, 'err')); }
+}
+
+async function openRun(name) {
+  const box = $('run-detail'); box.replaceChildren(el('p', 'Loading…', 'meta'));
+  try { archive = await api('/api/run?name=' + encodeURIComponent(name)); } catch (e) { box.replaceChildren(el('div', e.message, 'err')); return; }
+  const sum = archive.summary;
+  if (sum && sum.kind === 'benchmark') return renderBenchmark(sum, box);
+  box.replaceChildren(); const h = el('h1', archive.name); h.style.cssText = 'font:500 16px var(--mono);margin-bottom:12px'; box.append(h);
+  if (Array.isArray(sum)) {
+    for (const v of sum) {
+      const wrap = el('div', null, 'tablewrap tall'), t = el('table'), hr = el('tr');
+      hr.append(th(v.name), th('Texts', '', 1), th('Detected', 'Share of texts detected', 1), th('Mean z', 'Average score', 1)); t.append(hr);
+      for (const [c, s] of Object.entries(v.conditions)) { const tr = el('tr'), td = el('td', null, 'n'); td.append(heat(s.rate)); tr.append(el('td', c.replaceAll('_', ' ')), el('td', String(s.n), 'n'), td, el('td', fmt(s.mean_z), 'n')); t.append(tr); }
+      wrap.append(t); box.append(wrap);
+    }
+  } else {
+    const rows = Object.entries(sum || {}).filter(([, v]) => v && v.mean_z !== undefined).map(([n, v]) => ({ label: n.replaceAll('_', ' '), value: Math.max(v.mean_z, 0), text: fmt(v.mean_z, 1) + ' · ' + pct(v.detection_rate), color: v.mean_z >= 4 ? '#1b6c80' : '#cdced1' }));
+    if (rows.length) box.append(card(el('h2', 'Mean score · share detected'), hbars(rows, { left: 150 })));
+    if (archive.rows.length) {
+      const wrap = el('div', null, 'tablewrap'), t = el('table'), hr = el('tr');
+      hr.append(th('Prompt'), th('Condition'), th('Tokens', '', 1), th('Favored', '', 1), th('z', '', 1), th('Detected', '', 1)); t.append(hr);
+      for (const r of archive.rows.slice(0, 200)) { const tr = el('tr'); [r.prompt_id || r.sample || '', (r.condition || '').replaceAll('_', ' '), r.scored_tokens, r.green_ratio === '' || r.green_ratio == null ? '—' : pct(Number(r.green_ratio)), fmt(r.z_score), yes(r.detected) ? 'Yes' : 'No'].forEach((v, i) => tr.append(el('td', String(v), i > 1 ? 'n' : ''))); t.append(tr); }
+      wrap.append(t); box.append(wrap);
+    }
+  }
+  const files = Object.keys(archive.texts || {});
+  if (files.length) { const sel = el('select'); for (const f of files) sel.append(el('option', f)); const body = el('div', archive.texts[files[0]], 'hl'); sel.onchange = () => { body.textContent = archive.texts[sel.value]; }; box.append(card(sel, body)); }
+}
+
+/* ---------- wiring ---------- */
+async function init() {
+  const data = await api('/api/init'); token = data.token; $('key').value = data.key;
+  for (const p of data.prompts.slice(0, 5)) {
+    const text = typeof p === 'string' ? p : (p.prompt || p.text || '');
+    const b = el('button', text.replace(/^Explain (how |why |the )?/i, '').replace(/\.$/, ''), null, { type: 'button' }); b.onclick = () => { $('prompt').value = text; }; $('prompt-chips').append(b);
+  }
+  if (data.prompts.length && typeof data.prompts[0] === 'string') $('prompt').value = data.prompts[0];
+}
+$('nav').onclick = e => { if (e.target.dataset.view) setView(e.target.dataset.view); };
+$('menu').onclick = () => document.body.classList.toggle('nav-open');
+for (const b of document.querySelectorAll('.seg button')) b.onclick = () => setMode(b.dataset.mode);
+$('run').onclick = () => start(view);
+$('run-exp').onclick = () => { mode = 'real'; start('experiment'); };
+$('run-bench').onclick = () => { mode = 'real'; document.querySelector('.pop').open = false; start('benchmark'); };
+$('refresh').onclick = loadRuns;
+$('use-last').onclick = () => { if (last) $('text').value = last.text; };
+$('newkey').onclick = async () => { $('key').value = (await api('/api/init')).key; };
+$('cancel').onclick = () => jobId && api('/api/cancel', { id: jobId });
+setMode('real');
+init().catch(e => fail(e.message));
+setView('results');

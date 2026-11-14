@@ -1,29 +1,132 @@
-﻿<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Watermark Lab</title><link rel="stylesheet" href="/style.css"></head><body>
-<header><a class="brand" href="/">W<span>Watermark Lab</span></a><span class="local">Runs on your computer</span><button id="menu" class="secondary" aria-expanded="false" aria-controls="navigation">Menu</button></header>
-<div class="workspace"><aside id="navigation"><nav aria-label="Workspace"><a class="research-link" href="http://127.0.0.1:8766">Research bench<small>Live experiments and comparisons</small></a><button class="selected" data-tab="generate">Generate & compare<small>Start here</small></button><button data-tab="detect">Check a passage<small>Look for your watermark</small></button><button data-tab="attack">Try rewriting<small>See if the signal survives</small></button><button data-tab="experiment">Batch experiment<small>Test many prompts</small></button><button data-tab="results">Saved experiments<small>Review previous runs</small></button></nav><div class="aside-note"><strong>What is a watermark?</strong><p>A hidden pattern in the AI's word choices. This lab adds that pattern while generating text, then checks whether it can find it again.</p><p>It checks for this particular pattern. It cannot tell whether any random passage was written by AI.</p></div></aside>
-<main><div class="title"><div><h1 id="heading">Generate & compare</h1><p id="description">Read two passages side by side: one written normally, one with a hidden watermark.</p></div><span id="state" role="status">Ready</span></div>
-<section id="intro" class="intro"><h2>Compare the actual writing</h2><ol class="walkthrough"><li><strong>Generate two samples</strong><span>The same starting point, with and without a watermark.</span></li><li><strong>Compare the pattern</strong><span>Read the full passages first. Open the highlights to inspect the hidden pattern.</span></li><li><strong>Check the result</strong><span>The detector measures whether those choices appear unusually often.</span></li></ol></section>
-<div id="error" class="error" role="alert" hidden></div>
-<section id="controls" aria-label="Run setup"><h2 id="setup-heading">Choose what to generate</h2><label for="mode">How would you like to try it?</label><select id="mode" aria-describedby="notice"><option value="real">Generate readable paragraphs</option><option value="offline">Numeric mechanism test (no paragraphs)</option></select><p id="notice" class="notice"></p>
-<div id="model-fields" hidden><div class="model-grid"><label>Language model<input id="model" value="Qwen/Qwen2.5-0.5B-Instruct"><small>The model writes the text. First use may need a download.</small></label><label>Model version<input id="revision" value="main"><small>“main” uses the model's default version.</small></label></div></div>
-<div id="generation-fields" hidden><label>Choose a topic<select id="presets"><option value="">Use my own instructions</option></select></label><label>What should the AI write?<textarea id="prompt" rows="3">Explain how urban gardens can improve life in a city. Write a coherent passage of about 200 words.</textarea></label></div>
-<div id="text-fields" hidden><div class="field-heading"><label id="text-label" for="text">Passage to check</label><button id="use-last" class="text-button" hidden>Use my last watermarked sample</button></div><textarea id="text" rows="5" aria-describedby="text-help"></textarea><p id="text-help" class="help"></p><label id="attack-field" hidden>How should the text be rewritten?<select id="attack"><option value="paraphrase">Reword it three times</option><option value="translation">Translate to French, then back to English</option></select><small>We check the original and each rewritten version with the same detector.</small></label></div>
-<div id="experiment-fields" hidden><p>For each topic, generate an ordinary sample and a watermarked sample, then rewrite the watermarked text three times and translate it out and back. Compare how often the detector still finds the pattern.</p><label>How many topics? (1–20)<input id="limit" type="number" min="1" max="20" value="1"><small>Start with 1. Larger experiments generate more text and take longer.</small></label></div>
-<details id="settings"><summary>Advanced settings <span>Defaults are ready to use</span></summary><p class="help">You can run the demo without changing anything here.</p><div class="settings">
-<label class="key">Watermark key<input id="key" type="password" autocomplete="off"><small>A secret recipe for the pattern, created for you. Keep the same key to check these samples later. Reloading creates a new key.</small><button id="copy-key" type="button" class="text-button">Copy key to keep it</button><span id="key-status" role="status"></span></label>
-<label>Favored token share (gamma)<input id="gamma" type="number" value="0.25" step="0.01" min="0.01" max="0.99"><small>0.25 means about 25% of possible token choices are favored at each position.</small></label>
-<label>Watermark strength (delta)<input id="delta" type="number" value="2" step="0.1" min="0" max="10"><small>Higher values push the model toward the pattern more strongly. 0 adds no watermark.</small></label>
-<label>Detection cutoff<input id="threshold" type="number" value="4" step="0.1" min="0" max="20"><small>A signal score at or above this value counts as detected. 4 is this experiment's default.</small></label>
-<label>Maximum output tokens<input id="max_new_tokens" type="number" value="200" min="16" max="512"><small>A token is a piece of a word, or one number in the demo. Longer samples give more evidence.</small></label>
-<label>Randomness (temperature)<input id="temperature" type="number" value="0.8" step="0.1" min="0.1" max="2"><small>Higher values allow less predictable token choices.</small></label>
-<label>Choice pool (top p)<input id="top_p" type="number" value="0.95" step="0.01" min="0.01" max="1"><small>Keep choices covering this share of probability. 0.95 means 95%.</small></label>
-<label>Random seed<input id="seed" type="number" value="1234" min="0" max="2147483647"><small>Starting number for randomness. The pair uses the same seed for comparison.</small></label>
-</div></details><div class="actions"><button id="run" class="primary" disabled>Preparing workspace…</button><button id="cancel" class="secondary" hidden>Stop run</button><span id="action-help">Readable paragraphs use a trained language model.</span></div><button id="smoke" class="text-button" hidden>Run a numeric batch demo instead</button></section>
-<section id="progress" class="progress" hidden><h2 id="progress-heading">Generating your samples</h2><p id="progress-message" role="status">Starting the local model. Your results will appear below.</p><details><summary>Technical progress log</summary><pre id="log">Starting…</pre></details></section>
-<section id="output" hidden><div class="section-title"><h2>Your results</h2><button id="export" class="secondary">Download results</button></div><div id="takeaway" class="takeaway" role="status"></div><details class="reading-guide"><summary>How to read these results</summary><p><strong>Signal score (z-score):</strong> how far the pattern is above what we'd expect by chance. Higher means more evidence. It is not a percentage or a probability that AI wrote the passage.</p><p><strong>Favored choices:</strong> the share of checked tokens on the green list. The list changes at each position using the previous token and your key.</p><p><strong>Checked tokens:</strong> the token pairs counted as evidence. The first token, special tokens, and repeated pairs are excluded.</p><p>The cutoff is an experimental setting. Detection can be wrong; a result below the cutoff does not prove a watermark is absent.</p></details><div id="samples" class="samples"></div><p id="french"></p></section>
-<section id="results" hidden><div class="section-title"><h2>Experiment archive</h2><button id="refresh" class="secondary">Refresh</button></div><label>Choose a saved experiment<select id="runs"></select></label><p id="run-note"></p><p class="help">Signal score means strength of the pattern, not a probability. The chart compares average scores; the table shows each individual measurement.</p><div id="chart" class="chart"></div><div class="section-title"><h2>Individual measurements</h2><button id="csv" class="secondary">Download CSV</button></div><div class="table-wrap"><table><thead><tr><th>Sample</th><th>Version</th><th>Checked tokens</th><th>Favored share</th><th>Signal score</th><th>Pattern detected?</th></tr></thead><tbody id="rows"></tbody></table></div><label>Read a saved sample<select id="passages"></select></label><div id="passage" class="sample-prose archive-prose"></div></section>
-<footer><details><summary>How the hidden pattern works</summary><p>Before each token is chosen, the key and previous token determine a “green list” of favored choices. Watermarked generation makes those choices more likely. The detector rebuilds the same lists and checks whether the passage uses them unusually often.</p><p>This research prototype uses HMAC-SHA256 and PCG64. Its approximate p-values and default detection cutoff have not been calibrated to guarantee a particular false-positive rate.</p></details></footer></main></div><script src="/app.js"></script></body></html>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Watermark Lab</title>
+<meta name="description" content="Compare watermark schemes on speed, text quality and detection, and test your own text.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%231b6c80'/%3E%3Cpath d='M7 20l5-8 4 6 3-4 6 8' fill='none' stroke='white' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="frame">
+  <aside class="side" aria-label="Sections">
+    <div class="brand"><span class="mark" aria-hidden="true"></span><span>Watermark Lab</span></div>
+    <nav class="nav" id="nav">
+      <button data-view="results" class="on">Compare</button>
+      <button data-view="generate">Generate &amp; compare</button>
+      <button data-view="detect">Check text</button>
+      <button data-view="attack">Rewrite test</button>
+      <button data-view="runs">Runs</button>
+    </nav>
+    <div class="side-foot"><div class="chip" id="job-chip"><i></i><span>Idle</span></div></div>
+  </aside>
 
+  <header class="top">
+    <button class="menu" id="menu" aria-label="Open sections">Menu</button>
+    <span class="crumb" id="crumb">Compare</span>
+    <span class="spacer"></span>
+    <button class="ghost" id="cancel" hidden>Cancel job</button>
+  </header>
 
+  <main class="sheet">
+    <section id="results" class="view">
+      <div class="row-between wrap-gap">
+        <h1>Compare schemes</h1>
+        <details class="pop">
+          <summary class="ghost">Run benchmark</summary>
+          <div class="pop-body card">
+            <label for="bench-limit">Prompts</label>
+            <input id="bench-limit" type="number" min="1" max="20" value="20" title="Two seeds each. 20 prompts is roughly 25 minutes on the GPU.">
+            <div class="actions"><button class="primary" id="run-bench">Start</button></div>
+          </div>
+        </details>
+      </div>
+      <div id="bench-out"></div>
+    </section>
 
+    <section id="bench" class="view" hidden>
+      <h1 id="title">Generate &amp; compare</h1>
+      <div class="card input-card">
+        <div id="in-generate">
+          <label for="prompt">Prompt</label>
+          <textarea id="prompt" rows="3" placeholder="Explain how vaccines train the immune system."></textarea>
+          <div class="chips" id="prompt-chips" aria-label="Example prompts"></div>
+        </div>
+        <div id="in-text" hidden>
+          <div class="row-between"><label for="text">Text</label><button class="link" id="use-last" hidden>Paste watermarked sample</button></div>
+          <textarea id="text" rows="7" placeholder="Paste text."></textarea>
+          <div id="attack-pick" hidden>
+            <label for="attack">Rewrite</label>
+            <select id="attack">
+              <option value="paraphrase">Paraphrase ×3</option>
+              <option value="translation">French and back</option>
+            </select>
+          </div>
+        </div>
+        <div class="controls">
+          <div>
+            <label for="scheme">Scheme</label>
+            <select id="scheme">
+              <option value="v1">v1 · previous-token</option>
+              <option value="v2-h1">v2 · hash, context 1</option>
+              <option value="v2-h4">v2 · hash, context 4</option>
+              <option value="v2-min4">v2 · min-hash, context 4</option>
+            </select>
+          </div>
+          <div class="seg" role="group" aria-label="Mode">
+            <button data-mode="real" class="on" title="Real language model">Text</button>
+            <button data-mode="offline" title="Instant demo with an untrained model; output is token IDs">Demo</button>
+          </div>
+          <button class="primary" id="run">Generate &amp; compare</button>
+        </div>
+      </div>
+
+      <details class="card settings" id="settings">
+        <summary>Settings</summary>
+        <div class="grid4">
+          <div><label for="model">Model</label><input id="model" value="Qwen/Qwen2.5-0.5B-Instruct"></div>
+          <div><label for="revision">Revision</label><input id="revision" value="main"></div>
+          <div class="span2"><label for="key">Key <button class="link" id="newkey" type="button">New</button></label>
+            <input id="key" class="mono" autocomplete="off" spellcheck="false"></div>
+          <div><label for="gamma" title="Share of words that count as favored by chance">Green share</label><input id="gamma" type="number" step="0.05" min="0.01" max="0.99" value="0.25"></div>
+          <div><label for="delta" title="How strongly favored words are boosted while writing">Strength</label><input id="delta" type="number" step="0.5" min="0" max="10" value="2"></div>
+          <div><label for="threshold" title="Score at or above this counts as detected">Detect at z ≥</label><input id="threshold" type="number" step="0.5" min="0" max="20" value="4"></div>
+          <div><label for="temperature">Temperature</label><input id="temperature" type="number" step="0.1" min="0.1" max="2" value="0.8"></div>
+          <div><label for="top_p">Top-p</label><input id="top_p" type="number" step="0.05" min="0.01" max="1" value="0.95"></div>
+          <div><label for="max_new_tokens">Max tokens</label><input id="max_new_tokens" type="number" step="16" min="16" max="512" value="256"></div>
+          <div><label for="seed">Seed</label><input id="seed" type="number" min="0" value="1234"></div>
+        </div>
+      </details>
+
+      <div id="out" aria-live="polite"><div id="result"></div></div>
+    </section>
+
+    <section id="runs" class="view" hidden>
+      <div class="runs-grid">
+        <div class="col-list">
+          <div class="row-between"><h1>Runs</h1><button class="ghost" id="refresh">Refresh</button></div>
+          <div id="run-list" class="run-list"></div>
+          <details class="card settings">
+            <summary>New experiment</summary>
+            <label for="limit">Prompts</label>
+            <input id="limit" type="number" min="1" max="20" value="1">
+            <div class="actions"><button class="primary" id="run-exp">Start</button></div>
+          </details>
+        </div>
+        <div class="col-detail" id="run-detail"></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<aside class="toast card" id="job" hidden aria-live="polite">
+  <div class="row-between"><strong id="job-title">Working</strong><span class="mono small" id="job-time"></span></div>
+  <div class="bar"><i></i></div>
+  <pre id="log"></pre>
+</aside>
+<script src="/app.js"></script>
+</body>
+</html>
